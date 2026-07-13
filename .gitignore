@@ -1,0 +1,12 @@
+# The REAL registry is a private composition — only the example ships.
+soc_master_apps.json
+# Built artifacts + machine-local
+*.exe
+launchers/
+icon_source/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+soc_master_widget.bat

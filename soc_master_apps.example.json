@@ -1,0 +1,40 @@
+{
+  "_comment": "SOC Master Widget registry. Copy to soc_master_apps.json and register YOUR apps. 'dir' = working dir (relative to this file or absolute). 'cmd' = argv array ('cmd_linux' overrides on Linux). 'console' true = own console window. 'order' = Start-Stack sequence. 'in_stack' false = on-demand only. 'action' true = fire-and-forget (not tracked as a running app).",
+  "title": "SOC Master Widget",
+  "apps": [
+    {
+      "name": "My Server App",
+      "order": 1,
+      "dir": "../my-server-app",
+      "cmd": ["cmd", "/c", "run.bat"],
+      "cmd_linux": ["./run.sh"],
+      "console": true,
+      "note": "starts first in the stack"
+    },
+    {
+      "name": "My GUI App",
+      "order": 2,
+      "dir": "C:\Path\To\App",
+      "cmd": ["C:\Path\To\App\app.exe"],
+      "console": false
+    },
+    {
+      "name": "SOC Ultralight",
+      "order": 3,
+      "dir": "../SOC_Ultralight",
+      "cmd": ["pyw", "soc_ultralight.py"],
+      "console": false,
+      "note": "the swarm orchestrator"
+    },
+    {
+      "name": "On-Demand Tool",
+      "order": 4,
+      "in_stack": false,
+      "dir": ".",
+      "cmd": ["pyw", "soc_show_a4.pyw"],
+      "action": true,
+      "console": false,
+      "note": "fire-and-forget control signal - not part of Start Stack"
+    }
+  ]
+}
