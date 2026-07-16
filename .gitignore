@@ -1,5 +1,7 @@
 # The REAL registry is a private composition — only the example ships.
 soc_master_apps.json
+# Machine-local snap-grid window positions (per-desktop; nothing to share).
+soc_grid.json
 # Built artifacts + machine-local
 *.exe
 launchers/

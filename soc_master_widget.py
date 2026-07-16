@@ -22,6 +22,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 # Frozen-aware: as a PyInstaller exe, __file__ points into the temp unpack dir —
@@ -209,6 +211,167 @@ def switch_desktop(direction: str):
         u.keybd_event(vk, 0, 2, 0)     # KEYEVENTF_KEYUP
 
 
+# ── Snap grid — align any set of windows with one click ──────────────────────
+# Moved here from the SOC GUI (which was overcrowded). The widget can MoveWindow
+# ANY top-level window by its title, so it is the natural home for a whole-desktop
+# "snap everything back into place" button. Click-add each window you want in the
+# grid (an agent, A4 vision, the outbox monitor, even this widget itself); "Snap
+# to Grid" then restores every one to its saved position/size in a single click.
+# Positions live in a machine-local soc_grid.json (git-ignored). Stdlib only —
+# win32 comes through ctypes exactly like the dock above, never pywin32.
+
+GRID_CONFIG = HERE / "soc_grid.json"
+SW_RESTORE = 9      # ShowWindow: un-minimize before moving
+GA_ROOT = 2         # GetAncestor: climb from the clicked child to its top-level
+VK_LBUTTON = 0x01   # left mouse button, for click-to-pick
+
+
+def grid_valid_title(title: str) -> bool:
+    """A window is eligible for the grid if it has a real title and is not the
+    desktop shell. Pure/testable."""
+    t = (title or "").strip()
+    return bool(t) and t.lower() != "program manager"
+
+
+def grid_upsert(grid_windows, title, rect):
+    """Add a window, or update its rect if the title is already present (so re-
+    adding a window re-captures its current position). Order-preserving.
+    Pure/testable — the win32 capture/snap stays in the helpers below."""
+    out, updated = [], False
+    for wd in (grid_windows or []):
+        if wd.get("title") == title:
+            out.append({"title": title, "rect": list(rect)})
+            updated = True
+        else:
+            out.append(wd)
+    if not updated:
+        out.append({"title": title, "rect": list(rect)})
+    return out
+
+
+def title_match(saved: str, candidate: str) -> bool:
+    """Loose title match (prefix-30, either direction) so a window is still found
+    after its title gains or loses a suffix. Pure/testable."""
+    s = (saved or "").strip().lower()
+    c = (candidate or "").strip().lower()
+    if not s or not c:
+        return False
+    return s[:30] in c or c[:30] in s
+
+
+def load_grid(path: Path | None = None) -> list:
+    """Read the saved grid (list of {title, rect}); [] if missing/invalid."""
+    p = path or GRID_CONFIG
+    try:
+        raw = json.loads(Path(p).read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [w for w in raw
+            if isinstance(w, dict) and w.get("title") and w.get("rect")]
+
+
+def save_grid(grid_windows, path: Path | None = None) -> None:
+    """Persist the grid; failures are swallowed (window positions are non-critical)."""
+    p = path or GRID_CONFIG
+    try:
+        Path(p).write_text(json.dumps(list(grid_windows), indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def find_window_by_title(title: str):
+    """First visible, non-minimized top-level window whose title loosely matches
+    `title`. Windows-only (ctypes/user32); returns the hwnd or None. Re-resolving
+    by title means a window reopened at a new handle is still found."""
+    if not title:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum(hwnd, _lp):
+        if user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            if buf.value and title_match(title, buf.value):
+                found.append(hwnd)
+                return False
+        return True
+
+    try:
+        user32.EnumWindows(_enum, 0)
+    except Exception:
+        return None
+    return found[0] if found else None
+
+
+def snap_window(title: str, rect, hwnd=None):
+    """Move ONE window to rect, resolving its handle by title when the passed one
+    is missing/invalid. Returns (hwnd, status) — 'snapped' | 'missing' | 'error:…'."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    try:
+        valid = bool(hwnd) and user32.IsWindow(hwnd)
+    except Exception:
+        valid = False
+    if not valid:
+        hwnd = find_window_by_title(title)
+    if not hwnd:
+        return None, "missing"
+    try:
+        x, y, w, h = rect
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.MoveWindow(hwnd, int(x), int(y), int(w), int(h), True)
+        return hwnd, "snapped"
+    except Exception as e:
+        return hwnd, f"error: {e}"
+
+
+def mouse_left_down() -> bool:
+    """True while the physical left mouse button is held (async key state)."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    return bool(user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+
+
+def window_under_cursor():
+    """(title, [x, y, w, h]) of the top-level window under the cursor, or
+    ('', [0,0,0,0]) on failure. Windows-only. WindowFromPoint takes POINT BY
+    VALUE and returns a 64-bit HWND, so those prototypes are declared explicitly —
+    ctypes would otherwise mis-marshal the struct and truncate the handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+    class RECT(ctypes.Structure):
+        _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                    ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+    user32 = ctypes.windll.user32
+    try:
+        pt = POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        user32.WindowFromPoint.argtypes = [POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+        user32.GetAncestor.restype = wintypes.HWND
+        hwnd = user32.GetAncestor(user32.WindowFromPoint(pt), GA_ROOT)
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        r = RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return (buf.value or ""), [r.left, r.top, r.right - r.left, r.bottom - r.top]
+    except Exception:
+        return "", [0, 0, 0, 0]
+
+
 def load_config(platform: str | None = None, config_path: Path | None = None):
     """Load the registry, resolving per-OS fields.
 
@@ -382,11 +545,121 @@ def gui():
     mkbtn(ctrl, "▶  Start Stack", start_stack, fg=GREEN, accent=GREEN).pack(side="left")
     mkbtn(ctrl, "Refresh", lambda: refresh()).pack(side="left", padx=(8, 0))
 
-    tk.Label(outer, text="Log", bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(6, 2))
+    # ── Snap grid — align every registered window with one click ──────────────
+    # "Add Window" click-picks any top-level window (agent, A4 vision, outbox,
+    # even this widget) and remembers its title + current rect; "Snap to Grid"
+    # moves them all back. Windows-only; on other platforms the row is omitted.
+    if os.name == "nt":
+        grid_state = {"windows": load_grid()}
+
+        def grid_refresh_btn():
+            n = len(grid_state["windows"])
+            grid_add_btn.config(text=(f"⊞＋ Add ({n})" if n else "⊞＋ Add Window"))
+
+        def grid_snap():
+            wins = grid_state["windows"]
+            if not wins:
+                log("[grid] nothing added yet — use '⊞＋ Add Window' to pick windows")
+                return
+            snapped, missing = 0, []
+            for wd in wins:
+                title, rect = wd.get("title"), wd.get("rect")
+                if not title or not rect:
+                    continue
+                short = (title[:22] + "…") if len(title) > 22 else title
+                _h, status = snap_window(title, rect)
+                if status == "snapped":
+                    snapped += 1
+                elif status == "missing":
+                    missing.append(short)
+                else:
+                    log(f"[grid] '{short}' {status}")
+            msg = f"[grid] snapped {snapped}/{len(wins)} window(s)"
+            if missing:
+                msg += f" — not found: {', '.join(missing)}"
+            log(msg)
+
+        def grid_register(title, rect):
+            title = (title or "").strip()
+            if not grid_valid_title(title):
+                grid_refresh_btn()
+                log("[grid] ignored — click a real app window")
+                return
+            grid_state["windows"] = grid_upsert(grid_state["windows"], title, rect)
+            save_grid(grid_state["windows"])
+            grid_refresh_btn()
+            log(f"[grid] + '{title}'  ({rect[0]},{rect[1]}) {rect[2]}x{rect[3]}"
+                f"  [{len(grid_state['windows'])} in grid]")
+
+        def grid_clear(_e=None):
+            n = len(grid_state["windows"])
+            grid_state["windows"] = []
+            save_grid(grid_state["windows"])
+            grid_refresh_btn()
+            log(f"[grid] cleared {n} window(s)")
+
+        def grid_add():
+            log("[grid] click any window to add it to the grid…")
+            grid_add_btn.config(text="● click a window…")
+
+            def _capture():
+                deadline = time.time() + 2.0          # let the button click release
+                while time.time() < deadline and mouse_left_down():
+                    time.sleep(0.02)
+                deadline = time.time() + 15.0
+                while time.time() < deadline:
+                    if mouse_left_down():
+                        title, rect = window_under_cursor()
+                        while mouse_left_down():
+                            time.sleep(0.01)
+                        root.after(0, lambda t=title, r=rect: grid_register(t, r))
+                        return
+                    time.sleep(0.02)
+                root.after(0, lambda: (grid_refresh_btn(),
+                                       log("[grid] add-to-grid timed out")))
+
+            threading.Thread(target=_capture, daemon=True).start()
+
+        grid_ctrl = tk.Frame(outer, bg=BG)
+        grid_ctrl.pack(fill="x", pady=(0, 4))
+        mkbtn(grid_ctrl, "⊞ Snap to Grid", grid_snap, fg=ACCENT).pack(side="left")
+        grid_add_btn = mkbtn(grid_ctrl, "⊞＋ Add Window", grid_add)
+        grid_add_btn.pack(side="left", padx=(8, 0))
+        grid_add_btn.bind("<Button-3>", grid_clear)   # right-click = clear all
+        grid_refresh_btn()
+
+    # Collapsible log: click the header to hide/show the log pane. Collapsing
+    # drops the min height and shrinks the window to reclaim desktop space;
+    # expanding restores it. The log keeps recording while hidden.
+    log_hdr = tk.Label(outer, text="▾ Log", bg=BG, fg=MUTED, font=("Segoe UI", 8),
+                       cursor="hand2", anchor="w")
+    log_hdr.pack(anchor="w", pady=(6, 2), fill="x")
     logbox = tk.Text(outer, height=5, wrap="word", state="disabled", bg=BG2, fg=FG,
                      insertbackground=FG, relief="flat", highlightthickness=0, bd=0,
                      padx=6, pady=4, font=("Consolas", 8))
     logbox.pack(fill="both", expand=True)
+
+    _log_shown = {"v": True}
+
+    def toggle_log(_e=None):
+        root.update_idletasks()
+        if _log_shown["v"]:
+            h = logbox.winfo_height()
+            wcur, hcur = root.winfo_width(), root.winfo_height()
+            logbox.pack_forget()
+            log_hdr.config(text="▸ Log")
+            root.minsize(250, 300)                       # let it shrink while hidden
+            root.geometry(f"{wcur}x{max(hcur - h, 300)}")
+            _log_shown["v"] = False
+        else:
+            logbox.pack(fill="both", expand=True, before=dock)
+            log_hdr.config(text="▾ Log")
+            root.minsize(250, 540)                       # restore the expanded floor
+            root.update_idletasks()
+            root.geometry(f"{root.winfo_width()}x{max(root.winfo_height(), 540)}")
+            _log_shown["v"] = True
+
+    log_hdr.bind("<Button-1>", toggle_log)
 
     # ── Vi_minimizer dock — the pulsing rectangle ─────────────────────────────
     # Pulses yellow↔orange while the SOC swarm lives on ANOTHER virtual desktop

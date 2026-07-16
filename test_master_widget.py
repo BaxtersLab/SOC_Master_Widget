@@ -221,5 +221,71 @@ class SingletonTests(unittest.TestCase):
         w.notify_existing(("127.0.0.1", 47914))
 
 
+class GridTests(unittest.TestCase):
+    """Snap grid: click-add arbitrary windows (agent / A4 / outbox / this widget),
+    dedupe by title, one-click snap-all. The win32 capture/move needs a live
+    desktop; these cover the pure registry + persistence logic that drives it."""
+
+    def test_valid_title_rejects_empty_and_desktop(self):
+        self.assertTrue(w.grid_valid_title("A4 Vision"))
+        self.assertTrue(w.grid_valid_title("SOC Master Widget"))
+        self.assertFalse(w.grid_valid_title(""))
+        self.assertFalse(w.grid_valid_title("   "))
+        self.assertFalse(w.grid_valid_title("Program Manager"))   # desktop shell
+        self.assertFalse(w.grid_valid_title("program manager"))
+
+    def test_upsert_appends_new(self):
+        g = w.grid_upsert([], "A4 Vision", [10, 20, 300, 400])
+        self.assertEqual(g, [{"title": "A4 Vision", "rect": [10, 20, 300, 400]}])
+
+    def test_upsert_updates_in_place_no_duplicate(self):
+        g = [{"title": "A4", "rect": [0, 0, 1, 1]},
+             {"title": "OB", "rect": [5, 5, 5, 5]}]
+        g2 = w.grid_upsert(g, "A4", [10, 10, 200, 200])
+        self.assertEqual(g2, [{"title": "A4", "rect": [10, 10, 200, 200]},
+                              {"title": "OB", "rect": [5, 5, 5, 5]}])
+
+    def test_upsert_preserves_order_on_readd(self):
+        g = w.grid_upsert([], "W1", [0, 0, 1, 1])
+        g = w.grid_upsert(g, "W2", [0, 0, 1, 1])
+        g = w.grid_upsert(g, "W1", [9, 9, 9, 9])   # re-capture W1's position
+        self.assertEqual([x["title"] for x in g], ["W1", "W2"])
+        self.assertEqual(g[0]["rect"], [9, 9, 9, 9])
+
+    def test_title_match_prefix_tolerant(self):
+        self.assertTrue(w.title_match("Agent 1", "Agent 1 — Copilot"))   # gained suffix
+        self.assertTrue(w.title_match("SOC Ultralight — running", "SOC Ultralight"))
+        self.assertFalse(w.title_match("Agent 1", "Agent 2"))
+        self.assertFalse(w.title_match("", "anything"))
+
+    def test_grid_roundtrips_through_disk(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "soc_grid.json"
+            grid = w.grid_upsert([], "A4 Vision", [1, 2, 3, 4])
+            w.save_grid(grid, p)
+            self.assertEqual(w.load_grid(p), grid)
+
+    def test_load_grid_missing_or_garbage_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(w.load_grid(Path(d) / "nope.json"), [])
+            bad = Path(d) / "bad.json"
+            bad.write_text("{not json", encoding="utf-8")
+            self.assertEqual(w.load_grid(bad), [])
+            wrong = Path(d) / "wrong.json"
+            wrong.write_text('{"title": "x"}', encoding="utf-8")   # object, not list
+            self.assertEqual(w.load_grid(wrong), [])
+
+    def test_load_grid_drops_malformed_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "soc_grid.json"
+            p.write_text(json.dumps([
+                {"title": "Good", "rect": [0, 0, 10, 10]},
+                {"title": "NoRect"},
+                {"rect": [1, 1, 1, 1]},
+                "not-a-dict",
+            ]), encoding="utf-8")
+            self.assertEqual(w.load_grid(p), [{"title": "Good", "rect": [0, 0, 10, 10]}])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
