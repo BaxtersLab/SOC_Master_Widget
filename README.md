@@ -25,6 +25,14 @@ The widget itself needs **nothing but Python 3.10+** (stdlib only — Tkinter, c
   (working dir + argv; per-OS overrides via `cmd_linux`). Status dots:
   grey idle · green running · red exited.
 - **Start Stack** — launches your `order`-ed apps in sequence.
+- **Snap grid** — **Add Window** click-picks any top-level window (an app in
+  your stack, a helper window, even the board itself) and remembers its title +
+  position; **Snap to Grid** moves them all back into place with one click;
+  right-click **Add** clears the grid. Handles are re-resolved by title, so a
+  window reopened at a new spot is still found. Positions live in a git-ignored
+  `soc_grid.json`. Windows-only (uses `MoveWindow` via ctypes).
+- **Collapsible log** — click the **Log** header to hide/show the log pane;
+  collapsing shrinks the window to reclaim desktop space, expanding restores it.
 - **Second-instance prevention** — double-launching just brings the existing
   board to the front (port-bind lock; no stale lockfiles).
 - **Virtual-desktop dock** — the bottom rectangle pulses yellow/orange while
