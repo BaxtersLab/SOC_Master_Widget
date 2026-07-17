@@ -34,6 +34,17 @@ def linux_dir(app: dict) -> str:
     return app.get("dir_linux") or app.get("dir", ".")
 
 
+def resolved_dir(app: dict, config_parent: Path) -> str:
+    """Absolute app dir for the launcher. Relative registry dirs resolve
+    against the registry file's folder (same rule as the widget) — a relative
+    `cd` in the .sh would otherwise depend on the INVOKER's cwd, and
+    desktop-file-validate warns on a relative Path= key."""
+    d = linux_dir(app)
+    if d.startswith("/"):
+        return d
+    return (config_parent / d).resolve().as_posix()
+
+
 def gen(config_path: Path, out_root: Path) -> tuple[list[str], list[str]]:
     """Returns (written_files, skipped_app_names)."""
     data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -51,7 +62,7 @@ def gen(config_path: Path, out_root: Path) -> tuple[list[str], list[str]]:
             continue
         name = a.get("name", "app")
         slug = slugify(name)
-        d = linux_dir(a)
+        d = resolved_dir(a, config_path.parent)
         sh_path = launch_dir / f"{slug}.sh"
         sh_path.write_text(
             "#!/usr/bin/env bash\n"
