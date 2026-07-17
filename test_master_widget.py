@@ -9,6 +9,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,8 @@ class LoadConfigTests(unittest.TestCase):
         data = w.load_config(platform="win", config_path=cfg)
         self.assertEqual([a["name"] for a in data["apps"]], ["A", "B"])
 
+    @unittest.skipUnless(sys.platform == "win32",
+                         "asserts this Windows box's real registry dirs")
     def test_real_registry_still_ready_on_windows(self):
         # Regression: the live registry must stay fully READY on this box.
         data = w.load_config(platform="win")
@@ -213,8 +216,29 @@ class SingletonTests(unittest.TestCase):
         deadline = time.time() + 2.0
         while not hits and time.time() < deadline:
             time.sleep(0.02)
-        first.close()
+        # release (NOT bare close): on Linux a blocked accept() pins the
+        # listen socket in the kernel, keeping the port bound for later tests.
+        w.release_singleton(first)
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive(), "watcher thread failed to exit on release")
         self.assertTrue(hits, "holder never received the bring-to-front ping")
+
+    def test_release_frees_port_even_with_live_watcher(self):
+        """Linux regression: close() alone left the watcher pinning the port
+        (EADDRINUSE on relaunch within seconds). release_singleton must free
+        it deterministically."""
+        import threading
+        first = w.acquire_singleton(self.ADDR)
+        self.assertIsNotNone(first)
+        t = threading.Thread(target=w.watch_singleton,
+                             args=(first, lambda: None), daemon=True)
+        t.start()
+        w.release_singleton(first)
+        t.join(timeout=3.0)
+        self.assertFalse(t.is_alive())
+        second = w.acquire_singleton(self.ADDR)
+        self.assertIsNotNone(second, "port still pinned after release")
+        w.release_singleton(second)
 
     def test_notify_with_no_holder_is_silent(self):
         # No instance holds the port — must not raise.

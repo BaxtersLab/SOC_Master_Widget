@@ -49,6 +49,14 @@ def acquire_singleton(addr=SINGLETON_ADDR):
     for the process lifetime), or None when another instance holds it."""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if os.name != "nt":
+        # Linux: a just-closed board leaves the port in TIME_WAIT for ~60s and
+        # a fresh bind fails (EADDRINUSE) — the relaunch would refuse to open.
+        # SO_REUSEADDR permits the TIME_WAIT rebind while STILL rejecting a
+        # second live listener on Linux, so the single-instance guarantee
+        # holds. (On Windows SO_REUSEADDR can steal an active listen — weaker
+        # semantics — so it stays off there; Windows rebinds fine anyway.)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(addr)
         s.listen(2)
@@ -68,13 +76,43 @@ def notify_existing(addr=SINGLETON_ADDR):
         pass
 
 
+def release_singleton(lock_sock):
+    """Release the instance lock deterministically. shutdown() wakes a thread
+    blocked in accept() IMMEDIATELY on Linux (a bare close() does not — the
+    in-flight accept pins the listen socket in the kernel and the port stays
+    bound); on Windows shutdown on a listener just errors, harmlessly."""
+    import socket as _socket
+    try:
+        lock_sock.shutdown(_socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        lock_sock.close()
+    except OSError:
+        pass
+
+
 def watch_singleton(lock_sock, on_ping):
     """Accept pings from later launches; call on_ping() for each. Run on a
-    daemon thread; returns when the lock socket is closed (app exit)."""
+    daemon thread; returns when the lock socket is released (app exit).
+    A 1s accept timeout is the backstop: Linux does not wake a blocked
+    accept() when the fd is closed elsewhere, so poll for closure too."""
+    import socket as _socket
+    try:
+        lock_sock.settimeout(1.0)
+    except OSError:
+        return
     while True:
         try:
             conn, _ = lock_sock.accept()
             conn.close()
+        except _socket.timeout:
+            try:
+                if lock_sock.fileno() == -1:   # released elsewhere
+                    return
+            except OSError:
+                return
+            continue
         except OSError:
             return
         try:
@@ -628,12 +666,16 @@ def gui():
         grid_add_btn.bind("<Button-3>", grid_clear)   # right-click = clear all
         grid_refresh_btn()
 
-    # Collapsible log: click the header to hide/show the log pane. Collapsing
-    # drops the min height and shrinks the window to reclaim desktop space;
-    # expanding restores it. The log keeps recording while hidden.
-    log_hdr = tk.Label(outer, text="▾ Log", bg=BG, fg=MUTED, font=("Segoe UI", 8),
-                       cursor="hand2", anchor="w")
-    log_hdr.pack(anchor="w", pady=(6, 2), fill="x")
+    # Collapsible log: a header row with a real Hide/Show button. Collapsing drops
+    # the min height and shrinks the window to reclaim desktop space; expanding
+    # restores it. The log keeps recording while hidden.
+    log_row = tk.Frame(outer, bg=BG)
+    log_row.pack(fill="x", pady=(6, 2))
+    tk.Label(log_row, text="Log", bg=BG, fg=MUTED, font=("Segoe UI", 8),
+             anchor="w").pack(side="left")
+    log_toggle_btn = mkbtn(log_row, "▾ Hide", lambda: None, fg=MUTED)
+    log_toggle_btn.configure(font=("Segoe UI", 8, "bold"), padx=8, pady=1)
+    log_toggle_btn.pack(side="right")
     logbox = tk.Text(outer, height=5, wrap="word", state="disabled", bg=BG2, fg=FG,
                      insertbackground=FG, relief="flat", highlightthickness=0, bd=0,
                      padx=6, pady=4, font=("Consolas", 8))
@@ -647,19 +689,19 @@ def gui():
             h = logbox.winfo_height()
             wcur, hcur = root.winfo_width(), root.winfo_height()
             logbox.pack_forget()
-            log_hdr.config(text="▸ Log")
+            log_toggle_btn.config(text="▸ Show")
             root.minsize(250, 300)                       # let it shrink while hidden
             root.geometry(f"{wcur}x{max(hcur - h, 300)}")
             _log_shown["v"] = False
         else:
             logbox.pack(fill="both", expand=True, before=dock)
-            log_hdr.config(text="▾ Log")
+            log_toggle_btn.config(text="▾ Hide")
             root.minsize(250, 540)                       # restore the expanded floor
             root.update_idletasks()
             root.geometry(f"{root.winfo_width()}x{max(root.winfo_height(), 540)}")
             _log_shown["v"] = True
 
-    log_hdr.bind("<Button-1>", toggle_log)
+    log_toggle_btn.configure(command=toggle_log)
 
     # ── Vi_minimizer dock — the pulsing rectangle ─────────────────────────────
     # Pulses yellow↔orange while the SOC swarm lives on ANOTHER virtual desktop
