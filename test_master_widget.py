@@ -182,6 +182,167 @@ class ActionEntryTests(unittest.TestCase):
         self.assertTrue(entry["_ready"])
 
 
+@unittest.skipUnless(sys.platform == "win32", "window_title focus path is Windows-only")
+class WindowTitleFocusTests(unittest.TestCase):
+    """Regression for the VSCodium 'Start does nothing visible' bug: an app
+    that enforces its own single-instance lock (Electron) hands off to its
+    existing window and quits when relaunched, and that window's own attempt
+    to raise itself is often refused by Windows' foreground-lock rules. An app
+    declaring 'window_title' must be found-and-focused directly instead of
+    relaunched, whether its existing window is normal or minimized."""
+
+    def _app(self, **extra):
+        base = {"name": "VSCodium", "_cmd": ["x.exe"], "_dir": Path("."),
+                "console": False, "window_title": "VSCodium",
+                "window_process": "VSCodium.exe"}
+        base.update(extra)
+        return base
+
+    def test_existing_window_is_focused_not_relaunched(self):
+        import unittest.mock as mock
+        procs, logs = {}, []
+        with mock.patch("soc_master_widget._find_window", return_value=999) as find, \
+             mock.patch("soc_master_widget.restore_and_focus", return_value=True) as focus, \
+             mock.patch("subprocess.Popen") as popen:
+            status = w._launch(self._app(), logs.append, procs)
+        find.assert_called_once_with("VSCodium", "VSCodium.exe")
+        focus.assert_called_once_with(999)
+        popen.assert_not_called()                             # no redundant process
+        self.assertEqual(status, "focused")
+        self.assertNotIn("VSCodium", procs)                   # nothing to track/poll
+        self.assertTrue(any("[focus]" in m and "brought to front" in m for m in logs))
+
+    def test_focus_failure_is_reported_not_silent(self):
+        import unittest.mock as mock
+        procs, logs = {}, []
+        with mock.patch("soc_master_widget._find_window", return_value=999), \
+             mock.patch("soc_master_widget.restore_and_focus", return_value=False):
+            status = w._launch(self._app(), logs.append, procs)
+        self.assertEqual(status, "focused")
+        self.assertTrue(any("could not focus" in m for m in logs))
+
+    def test_no_existing_window_spawns_normally(self):
+        import unittest.mock as mock
+        procs, logs = {}, []
+        with mock.patch("soc_master_widget._find_window", return_value=None) as find, \
+             mock.patch("subprocess.Popen", return_value=mock.Mock(pid=4321)) as popen:
+            status = w._launch(self._app(), logs.append, procs)
+        find.assert_called_once_with("VSCodium", "VSCodium.exe")
+        popen.assert_called_once()
+        self.assertEqual(status, "started")
+        self.assertIn("VSCodium", procs)                      # tracked for status dot + poll
+
+    def test_app_without_window_title_never_probes_windows(self):
+        # Every existing app entry (no window_title) must be unaffected: no
+        # ctypes window lookup at all, exactly the pre-change behavior.
+        import unittest.mock as mock
+        procs, logs = {}, []
+        app = self._app(window_title=None)
+        with mock.patch("soc_master_widget._find_window") as find, \
+             mock.patch("subprocess.Popen", return_value=mock.Mock(pid=1)):
+            w._launch(app, logs.append, procs)
+        find.assert_not_called()
+
+
+class VSCodiumDependencyTests(unittest.TestCase):
+    """VSCodium is registered as a managed dependency ('auto_locate':
+    'vscodium'): if its configured path ever goes stale the widget re-probes
+    PATH/common install dirs itself, then a 'Locate/Install' button lets the
+    operator browse to it or trigger a silent winget install. These test the
+    injectable search/persist/install logic without touching the real
+    filesystem, PATH, or actually invoking winget."""
+
+    def test_candidate_paths_from_env(self):
+        env = {"LOCALAPPDATA": r"C:\Users\x\AppData\Local",
+               "ProgramFiles": r"C:\Program Files"}
+        cands = [str(p) for p in w._candidate_vscodium_paths(env)]
+        self.assertIn(r"C:\Users\x\AppData\Local\Programs\VSCodium\VSCodium.exe", cands)
+        self.assertIn(r"C:\Program Files\VSCodium\VSCodium.exe", cands)
+
+    def test_candidate_paths_skips_unset_env_vars(self):
+        self.assertEqual(w._candidate_vscodium_paths({}), [])
+
+    def test_find_vscodium_direct_exe_on_path(self):
+        target = Path(r"C:\Users\x\AppData\Local\Programs\VSCodium\VSCodium.exe")
+        found = w.find_vscodium(
+            env={}, which=lambda name: str(target) if name == "VSCodium.exe" else None,
+            is_file=lambda p: Path(p) == target)
+        self.assertEqual(found, target)
+
+    def test_find_vscodium_resolves_codium_cmd_sibling(self):
+        # `codium` on PATH typically points at .../VSCodium/bin/codium(.cmd);
+        # the real exe is one directory up.
+        root = Path(r"C:\Users\x\AppData\Local\Programs\VSCodium")
+        cmd_path = root / "bin" / "codium.cmd"
+        exe_path = root / "VSCodium.exe"
+        found = w.find_vscodium(
+            env={},
+            which=lambda name: str(cmd_path) if name == "codium" else None,
+            is_file=lambda p: Path(p) == exe_path)
+        self.assertEqual(found, exe_path)
+
+    def test_find_vscodium_falls_back_to_candidate_dirs(self):
+        env = {"LOCALAPPDATA": r"C:\Users\x\AppData\Local"}
+        target = Path(r"C:\Users\x\AppData\Local\Programs\VSCodium\VSCodium.exe")
+        found = w.find_vscodium(env=env, which=lambda name: None,
+                                 is_file=lambda p: Path(p) == target)
+        self.assertEqual(found, target)
+
+    def test_find_vscodium_returns_none_when_nowhere(self):
+        found = w.find_vscodium(env={}, which=lambda name: None, is_file=lambda p: False)
+        self.assertIsNone(found)
+
+    def test_set_app_path_updates_and_persists(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = write_cfg(Path(d), [
+                {"name": "VSCodium", "dir": "old", "cmd": ["old.exe"]},
+                {"name": "Other", "dir": "keep", "cmd": ["keep.exe"]}])
+            new_exe = Path(d) / "new_spot" / "VSCodium.exe"
+            ok = w.set_app_path(cfg, "VSCodium", new_exe)
+            self.assertTrue(ok)
+            data = json.loads(cfg.read_text(encoding="utf-8"))
+            entries = {a["name"]: a for a in data["apps"]}
+            self.assertEqual(entries["VSCodium"]["cmd"], [str(new_exe)])
+            self.assertEqual(entries["VSCodium"]["dir"], str(new_exe.parent))
+            self.assertEqual(entries["Other"]["cmd"], ["keep.exe"])   # untouched
+
+    def test_set_app_path_unknown_app_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = write_cfg(Path(d), [{"name": "A", "dir": "d", "cmd": ["a.exe"]}])
+            before = cfg.read_text(encoding="utf-8")
+            ok = w.set_app_path(cfg, "NoSuchApp", Path("x.exe"))
+            self.assertFalse(ok)
+            self.assertEqual(cfg.read_text(encoding="utf-8"), before)   # untouched
+
+    def test_install_winget_missing_reports_not_found(self):
+        ok, msg = w.install_vscodium_via_winget(which=lambda name: None)
+        self.assertFalse(ok)
+        self.assertIn("winget not found", msg)
+
+    def test_install_winget_success(self):
+        import unittest.mock as mock
+        run = mock.Mock(return_value=mock.Mock(returncode=0, stdout="", stderr=""))
+        ok, msg = w.install_vscodium_via_winget(run=run, which=lambda name: "winget.exe")
+        self.assertTrue(ok)
+        self.assertIn("installed", msg)
+        run.assert_called_once()
+        self.assertIn("VSCodium.VSCodium", run.call_args[0][0])
+
+    def test_install_winget_nonzero_exit_reports_stderr(self):
+        import unittest.mock as mock
+        run = mock.Mock(return_value=mock.Mock(returncode=1, stdout="", stderr="no package found"))
+        ok, msg = w.install_vscodium_via_winget(run=run, which=lambda name: "winget.exe")
+        self.assertFalse(ok)
+        self.assertIn("no package found", msg)
+
+    def test_install_winget_exception_is_caught(self):
+        def boom(*a, **k):
+            raise OSError("boom")
+        ok, msg = w.install_vscodium_via_winget(run=boom, which=lambda name: "winget.exe")
+        self.assertFalse(ok)
+        self.assertIn("OSError", msg)
+
+
 class SingletonTests(unittest.TestCase):
     """Second-instance prevention: bind-lock port + ping-to-front handshake.
     Uses a test-only port so a live widget (real port 47611) never interferes."""

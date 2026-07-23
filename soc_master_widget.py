@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -152,10 +153,47 @@ SOC_WINDOW_TITLE = "SOC Ultralight"   # marker window for the swarm's desktop
 _vdm_ptr = None   # cached COM pointer (False = init failed, don't retry)
 
 
-def _find_window(title_substr: str):
-    """First visible top-level window whose title contains the substring.
-    Windows on OTHER virtual desktops are still enumerated (cloaked, but
-    visible) — exactly what the dock needs."""
+def _window_owner_exe(hwnd) -> str:
+    """Lowercase basename of the executable owning hwnd's process (''  on any
+    failure). ctypes-only, no pywin32 — matches the rest of this file."""
+    import ctypes
+    from ctypes import wintypes
+    import ntpath
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    try:
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h:
+            return ""
+        try:
+            kernel32.QueryFullProcessImageNameW.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                ctypes.POINTER(wintypes.DWORD)]
+            buf = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(260)
+            if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+            return ntpath.basename(buf.value).lower()
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def _find_window(title_substr: str, exe_name: str | None = None):
+    """First visible top-level window whose title contains the substring
+    (case-insensitive). Windows on OTHER virtual desktops are still
+    enumerated (cloaked, but visible) — exactly what the dock needs.
+
+    When exe_name is given, also requires the window's owning process image
+    to match it (case-insensitive basename). Title-only matching can false-
+    positive on a generic app name that happens to appear in an unrelated
+    window's title (e.g. a browser tab or another editor's workspace name
+    mentioning it) — the exe check disambiguates. Without exe_name, behavior
+    is unchanged from before (first title match wins, in Z-order)."""
     import ctypes
     from ctypes import wintypes
     user32 = ctypes.windll.user32
@@ -168,11 +206,50 @@ def _find_window(title_substr: str):
             user32.GetWindowTextW(hwnd, buf, 256)
             if title_substr.lower() in buf.value.lower():
                 found.append(hwnd)
-                return False
+                if not exe_name:
+                    return False   # first match is enough — same as before
         return True
 
     user32.EnumWindows(_enum, 0)
-    return found[0] if found else None
+    if not exe_name:
+        return found[0] if found else None
+    target = exe_name.lower()
+    for hwnd in found:
+        if _window_owner_exe(hwnd) == target:
+            return hwnd
+    return None
+
+
+def restore_and_focus(hwnd) -> bool:
+    """Un-minimize (if needed) and raise hwnd to the foreground.
+
+    A plain SetForegroundWindow often gets silently refused by Windows'
+    foreground-lock rules when called from a process that isn't the current
+    foreground app (exactly the case for a window found sitting minimized
+    from an earlier launch). AttachThreadInput temporarily joins our input
+    queue to the target window's so the OS treats the call as if it came
+    from that window's own thread, which the lock permits. Best-effort:
+    returns False (never raises) if anything about this fails.
+    """
+    import ctypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    try:
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        cur_tid = kernel32.GetCurrentThreadId()
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        attached = False
+        if target_tid and target_tid != cur_tid:
+            attached = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
+        try:
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(cur_tid, target_tid, False)
+        return True
+    except Exception:
+        return False
 
 
 def _vdm():
@@ -439,6 +516,90 @@ def load_config(platform: str | None = None, config_path: Path | None = None):
     return data
 
 
+# ── Dependency auto-resolution ───────────────────────────────────────────────
+# An entry can opt in with "auto_locate": "<name>" (see AUTO_LOCATORS below) so
+# that a stale/missing path isn't just a permanently disabled button: the
+# widget probes common install spots itself, then falls back to letting the
+# operator browse to the exe, then (if they agree) a silent winget install.
+# Each locator is injectable (env/which/is_file) so the search logic is
+# unit-testable without a real filesystem or real installs.
+
+def _candidate_vscodium_paths(env: dict | None = None) -> list[Path]:
+    """Common per-user/per-machine VSCodium install locations, most likely
+    first (winget's default user-scope install dir, then machine-wide)."""
+    env = os.environ if env is None else env
+    out = []
+    local = env.get("LOCALAPPDATA")
+    if local:
+        out.append(Path(local) / "Programs" / "VSCodium" / "VSCodium.exe")
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        pf = env.get(key)
+        if pf:
+            out.append(Path(pf) / "VSCodium" / "VSCodium.exe")
+    return out
+
+
+def find_vscodium(env: dict | None = None, which=shutil.which,
+                   is_file=Path.is_file) -> Path | None:
+    """Best-effort locate an installed VSCodium.exe: PATH first (covers a
+    winget/user install that registered itself), then common install
+    directories. which()/is_file() are injectable for testing; real callers
+    use the stdlib defaults."""
+    exe = which("VSCodium.exe") or which("VSCodium") or which("codium")
+    if exe:
+        p = Path(exe)
+        if p.name.lower() == "vscodium.exe" and is_file(p):
+            return p
+        # PATH commonly resolves 'codium' to bin\codium(.cmd) next to the
+        # real exe, one level up.
+        sibling = p.parent.parent / "VSCodium.exe"
+        if is_file(sibling):
+            return sibling
+    for cand in _candidate_vscodium_paths(env):
+        if is_file(cand):
+            return cand
+    return None
+
+
+AUTO_LOCATORS = {"vscodium": find_vscodium}
+
+
+def set_app_path(config_path: Path, app_name: str, exe_path: Path) -> bool:
+    """Point app_name's Windows cmd/dir at exe_path and persist to disk (the
+    registry stays the single source of truth — no separate state file).
+    Returns True if the app was found and updated."""
+    p = Path(config_path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    found = False
+    for a in data.get("apps", []):
+        if a.get("name") == app_name:
+            a["cmd"] = [str(exe_path)]
+            a["dir"] = str(Path(exe_path).parent)
+            found = True
+    if found:
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return found
+
+
+def install_vscodium_via_winget(run=subprocess.run, which=shutil.which):
+    """Best-effort silent install via winget (official package id
+    VSCodium.VSCodium). Returns (ok: bool, message: str). run()/which() are
+    injectable for testing without actually invoking winget."""
+    if not which("winget"):
+        return False, "winget not found on this system"
+    try:
+        r = run(["winget", "install", "--id", "VSCodium.VSCodium", "-e",
+                 "--silent", "--accept-package-agreements",
+                 "--accept-source-agreements"],
+                capture_output=True, text=True, timeout=600)
+        if r.returncode == 0:
+            return True, "installed via winget"
+        detail = (r.stderr or r.stdout or "").strip()[:300]
+        return False, f"winget exited {r.returncode}: {detail}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def check():
     """Headless validation: prove config + paths resolve. No window."""
     data = load_config()
@@ -458,18 +619,40 @@ def check():
 
 
 def _launch(app, log, procs):
+    """Returns a status string for callers that want to react (e.g. gui()'s
+    launch() starts a post-spawn window watch on "started"): "skip" | "error"
+    | "already-running" | "focused" | "action" | "started".
+    """
     name = app["name"]
     if not app.get("_cmd"):
         log(f"[skip]  {name}: no launch command for this OS (edit soc_master_apps.json)")
-        return
+        return "skip"
     d = app["_dir"]
     if not d.is_dir():
         log(f"[error] {name}: folder missing -> {d}")
-        return
+        return "error"
     existing = procs.get(name)
     if existing and existing.poll() is None:
         log(f"[info]  {name}: already running (pid {existing.pid})")
-        return
+        return "already-running"
+
+    # Apps that declare a window_title get found-and-focused instead of
+    # re-launched when a window already exists (even minimized/off-screen) —
+    # e.g. an Electron app like VSCodium enforces its own single-instance
+    # lock, so spawning again just makes it hand off to the existing window
+    # and quit, and its own attempt to raise that window is often refused by
+    # Windows' foreground-lock rules. Finding and focusing it ourselves,
+    # right after the button click that still owns recent input, is reliable
+    # where relying on the app's internal forwarding was not.
+    window_title = app.get("window_title")
+    if window_title and os.name == "nt":
+        hwnd = _find_window(window_title, app.get("window_process"))
+        if hwnd:
+            ok = restore_and_focus(hwnd)
+            log(f"[focus] {name}: existing window found — "
+                f"{'brought to front' if ok else 'could not focus (click its taskbar icon)'}")
+            return "focused"
+
     try:
         kwargs = {}
         if os.name == "nt" and app.get("console", True):
@@ -480,11 +663,14 @@ def _launch(app, log, procs):
             # Not tracked in procs: it is meant to exit immediately, so there is
             # no persistent process and its status dot stays idle (not "exited").
             log(f"[action] {name}: sent")
+            return "action"
         else:
             procs[name] = proc
             log(f"[start] {name}: pid {proc.pid}")
+            return "started"
     except Exception as e:  # never let one bad launch kill the widget
         log(f"[error] {name}: {type(e).__name__}: {e}")
+        return "error"
 
 
 def gui():
@@ -501,6 +687,23 @@ def gui():
     data = load_config()
     apps = data["apps"]
     procs = {}  # name -> Popen
+
+    # Silent auto-heal: an app registered with "auto_locate" whose configured
+    # path has gone stale (moved/reinstalled elsewhere) gets one quiet
+    # re-probe of common install spots before the board ever shows a button —
+    # no dialog, just a log line, same as any other startup status.
+    for a in apps:
+        if a["_ready"] or not a.get("auto_locate"):
+            continue
+        locator = AUTO_LOCATORS.get(a["auto_locate"])
+        found = locator() if locator else None
+        if found:
+            set_app_path(CONFIG, a["name"], found)
+            a["cmd"] = [str(found)]
+            a["_cmd"] = [str(found)]
+            a["_dir"] = Path(found).parent
+            a["_ready"] = True
+            print(f"[locate] {a['name']}: found -> {found} (saved to {CONFIG.name})")
 
     root = tk.Tk()
     root.title(data.get("title", "SOC Master Widget"))
@@ -537,6 +740,68 @@ def gui():
                          highlightthickness=0, cursor="hand2",
                          font=("Segoe UI", 9, "bold"), padx=12, pady=3)
 
+    row_buttons = {}  # name -> Button, so a resolved dependency can flip it back to "Start"
+
+    def _apply_found(app, exe_path):
+        name = app["name"]
+        set_app_path(CONFIG, name, exe_path)
+        app["cmd"] = [str(exe_path)]
+        app["_cmd"] = [str(exe_path)]
+        app["_dir"] = Path(exe_path).parent
+        app["_ready"] = True
+        btn = row_buttons.get(name)
+        if btn is not None:
+            btn.configure(text="Start", command=lambda app=app: launch(app), state="normal")
+        log(f"[locate] {name}: found -> {exe_path} (saved to {CONFIG.name})")
+
+    def try_auto_resolve(app):
+        """'Locate/Install' button: silent re-probe, then let the operator
+        browse to the exe, then (if they agree) a silent winget install."""
+        name = app["name"]
+        locator = AUTO_LOCATORS.get(app.get("auto_locate"))
+        found = locator() if locator else None
+        if found:
+            _apply_found(app, found)
+            return
+
+        import tkinter.filedialog as fd
+        log(f"[locate] {name}: not found automatically — choose its .exe, or Cancel to install it")
+        picked = fd.askopenfilename(
+            title=f"Locate {name}.exe", parent=root,
+            filetypes=[(f"{name} executable", "*.exe"), ("All files", "*.*")])
+        if picked:
+            _apply_found(app, Path(picked))
+            return
+
+        if app.get("auto_locate") != "vscodium":
+            log(f"[locate] {name}: no installer wired up for this app yet")
+            return
+        import tkinter.messagebox as mb
+        if not mb.askyesno("Install VSCodium?",
+                            "VSCodium wasn't found on this system.\n"
+                            "Install it now via winget (silent)?", parent=root):
+            log(f"[locate] {name}: skipped — click Locate/Install again once it's on the system")
+            return
+
+        log(f"[locate] {name}: installing via winget (this can take a minute)...")
+        btn = row_buttons.get(name)
+        if btn is not None:
+            btn.configure(state="disabled", text="Installing…")
+
+        def _install():
+            ok, msg = install_vscodium_via_winget()
+
+            def _done():
+                log(f"[locate] {name}: {msg}")
+                found2 = find_vscodium() if ok else None
+                if found2:
+                    _apply_found(app, found2)
+                elif btn is not None:
+                    btn.configure(state="normal", text="Locate/Install")
+            root.after(0, _done)
+
+        threading.Thread(target=_install, daemon=True).start()
+
     def refresh():
         for a in apps:
             p = procs.get(a["name"])
@@ -548,8 +813,29 @@ def gui():
                 dots[a["name"]].configure(fg=RED)           # exited
         root.after(2000, refresh)
 
+    def watch_for_window(app, deadline, name=None):
+        """Non-blocking poll (root.after, main thread only — no raw thread,
+        matching refresh()/_dock_poll() elsewhere in this file) for a freshly
+        spawned app's window to appear, then bring it to front. Covers apps
+        (VSCodium/Electron) that restore a previously-minimized window state
+        on launch, or are just slow to open a window."""
+        title = app.get("window_title")
+        nm = name or app["name"]
+        hwnd = _find_window(title, app.get("window_process")) if (title and os.name == "nt") else None
+        if hwnd:
+            ok = restore_and_focus(hwnd)
+            log(f"[focus] {nm}: window appeared — "
+                f"{'brought to front' if ok else 'could not focus'}")
+            return
+        if time.time() >= deadline:
+            log(f"[focus] {nm}: no window appeared yet (still starting?)")
+            return
+        root.after(500, lambda: watch_for_window(app, deadline, nm))
+
     def launch(app):
-        _launch(app, log, procs)
+        status = _launch(app, log, procs)
+        if status == "started" and app.get("window_title") and os.name == "nt":
+            root.after(500, lambda: watch_for_window(app, time.time() + 20.0))
         refresh()
 
     def start_stack():
@@ -573,10 +859,17 @@ def gui():
         dots[a["name"]] = dot
         tk.Label(row, text=f"{a.get('order','?')}. {a['name']}", bg=BG, fg=FG,
                  font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left", fill="x", expand=True)
-        btn = mkbtn(row, "Start", lambda app=a: launch(app))
+        ready = bool(a.get("_cmd")) and a["_dir"].is_dir()
+        if not ready and a.get("auto_locate"):
+            # Missing dependency the widget knows how to chase down itself,
+            # rather than a permanently-disabled button.
+            btn = mkbtn(row, "Locate/Install", lambda app=a: try_auto_resolve(app))
+        else:
+            btn = mkbtn(row, "Start", lambda app=a: launch(app))
+            if not ready:
+                btn.configure(state="disabled")
         btn.pack(side="right")
-        if not a.get("_cmd") or not a["_dir"].is_dir():
-            btn.configure(state="disabled")
+        row_buttons[a["name"]] = btn
 
     ctrl = tk.Frame(outer, bg=BG)
     ctrl.pack(fill="x", pady=(14, 8))

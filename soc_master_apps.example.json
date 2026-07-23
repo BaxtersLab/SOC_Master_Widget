@@ -1,5 +1,5 @@
 {
-  "_comment": "SOC Master Widget registry. Copy to soc_master_apps.json and register YOUR apps. 'dir' = working dir (relative to this file or absolute). 'cmd' = argv array ('cmd_linux' overrides on Linux). 'console' true = own console window. 'order' = Start-Stack sequence. 'in_stack' false = on-demand only. 'action' true = fire-and-forget (not tracked as a running app).",
+  "_comment": "SOC Master Widget registry. Copy to soc_master_apps.json and register YOUR apps. 'dir' = working dir (relative to this file or absolute). 'cmd' = argv array ('cmd_linux' overrides on Linux). 'console' true = own console window. 'order' = Start-Stack sequence. 'in_stack' false = on-demand only. 'action' true = fire-and-forget (not tracked as a running app). 'window_title' (optional, Windows-only) = substring of the app's window title; if a window already exists (even minimized) Start focuses it instead of relaunching — use this for single-instance GUI apps whose own focus-forwarding isn't reliable. 'window_process' (optional) = exe basename to also require, disambiguating from any unrelated window whose title happens to mention the same name.",
   "title": "SOC Master Widget",
   "apps": [
     {
