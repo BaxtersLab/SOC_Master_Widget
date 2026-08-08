@@ -637,3 +637,39 @@ class WindowManagementCapabilityTests(unittest.TestCase):
         src = Path(w.__file__).resolve().with_suffix(".py").read_text(encoding="utf-8")
         self.assertIn("if dock is not None:", src)
         self.assertIn("dock = None", src)
+
+
+class ExampleRegistryTests(unittest.TestCase):
+    """The example registry is not documentation — run.sh and run.bat COPY it
+    to soc_master_apps.json on first run, so it is the literal first-boot
+    config on both platforms. It shipped with `"C:\\Path\\To\\App"`, where \\P,
+    \\T and \\A are invalid JSON escapes, so every fresh install died with
+    JSONDecodeError before showing a single button."""
+
+    EXAMPLE = Path(w.__file__).resolve().parent / "soc_master_apps.example.json"
+
+    def test_example_registry_is_valid_json(self):
+        try:
+            json.loads(self.EXAMPLE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            self.fail(f"soc_master_apps.example.json is not valid JSON: {e}")
+
+    def test_example_registry_loads_the_way_a_first_run_would(self):
+        """Parsing is necessary but not sufficient — go through load_config,
+        which is what main() calls, on both platform resolutions."""
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "soc_master_apps.json"
+            shutil.copy(self.EXAMPLE, target)          # exactly what run.sh does
+            for platform in ("linux", "windows"):
+                with self.subTest(platform=platform):
+                    cfg = w.load_config(platform=platform, config_path=target)
+                    self.assertTrue(cfg.get("apps"), "example registry has no apps")
+
+    def test_example_registry_ships_no_operator_specific_apps(self):
+        """Baxter: the board must not carry an AiSmartGuy or Blind Box button.
+        The live registry is gitignored, so the example is the copy that can
+        reintroduce one on a fresh install or on the Windows fork."""
+        text = self.EXAMPLE.read_text(encoding="utf-8").lower()
+        for banned in ("aismartguy", "ai smart guy", "blindbox", "blind box"):
+            self.assertNotIn(banned, text,
+                             f"{banned!r} must not ship in the example registry")

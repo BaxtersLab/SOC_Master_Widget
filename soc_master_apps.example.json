@@ -14,8 +14,8 @@
     {
       "name": "My GUI App",
       "order": 2,
-      "dir": "C:\Path\To\App",
-      "cmd": ["C:\Path\To\App\app.exe"],
+      "dir": "C:\\Path\\To\\App",
+      "cmd": ["C:\\Path\\To\\App\\app.exe"],
       "console": false
     },
     {
