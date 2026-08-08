@@ -2,6 +2,88 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-08] — **Every fresh install was dead on arrival**: the example registry was invalid JSON. Plus a test that ERRORed on Windows, and the mirror advisory
+
+Writing the Windows mirror advisory turned up two defects I had shipped or
+inherited. Both are fixed; both affected Windows.
+
+### 1. The example registry was not valid JSON — since forever
+
+`soc_master_apps.example.json` is **not documentation**. `run.bat` and `run.sh`
+both COPY it to `soc_master_apps.json` on first run, so it is the literal
+first-boot config. It contained:
+
+```json
+"dir": "C:\Path\To\App",
+"cmd": ["C:\Path\To\App\app.exe"],
+```
+
+`\P`, `\T`, `\A` are not valid JSON escapes. `load_config()` raised
+`JSONDecodeError` and **a fresh install showed no buttons at all**. The broken
+value is a Windows path, so this hit the Windows fork at least as hard.
+
+It survived this long because the live registry is gitignored — every existing
+checkout on both boxes already had a working `soc_master_apps.json` and never
+re-read the example. My own fresh-clone test earlier this session ran `run.sh`,
+watched it report "creating soc_master_apps.json from the example", and I took
+the copy succeeding as the launcher working. **The copy did succeed. Loading it
+is what fails, and I never launched the board from that clone.** Copying a file
+is not evidence the file is usable.
+
+Fixed (`6d7eef6`). `ExampleRegistryTests`: valid JSON; survives `load_config`
+on **both** platform resolutions via the same copy `run.sh` performs; ships no
+operator-specific apps. Proven to fail first — 3 failed before, 3 passed after.
+
+### 2. I shipped a bash-dependent test into a cross-platform repo
+
+`test_run_sh_scrub.py` calls `subprocess.run(["bash", …])` with no guard. Once
+the Master Widget became one shared repo, that meant a Windows box with no bash
+on PATH would raise `FileNotFoundError` in the module-scoped fixture and **all
+13 tests would ERROR** — a red suite for a launcher Windows does not use, since
+the board starts there via `run.bat`.
+
+Guarded (`e2b6ff8`) with the same "no bash available" skip
+`test_master_widget.py` already used. Verified both directions on Linux: 13
+passed with bash present, 13 skipped and **zero errors** with bash unresolvable.
+
+### 3. Operator instruction: no AiSmartGuy, no Blind Box
+
+Baxter: the board must carry neither. AiSmartGuy was already removed from the
+live registry. **Blind Box does not exist anywhere on this box** — an
+exhaustive search found only unrelated SOC internals ("blind scroll", "blind
+click", "OCR blindzone"), and no repo under either account matches. Recorded in
+the advisory as Windows-side, flagged as needing operator confirmation rather
+than guessed at.
+
+Because the live registry is gitignored, neither removal can travel through the
+repo. The example is the only copy that could reintroduce one, so the test above
+pins it.
+
+### Open Stubs
+
+None introduced.
+
+### Verification
+
+* `pytest` → **58 passed, 8 skipped, 2 subtests** (55 before).
+* Fresh-install path re-tested properly this time: example copied to a temp
+  dir, then `load_config(platform=…)` for **both** `linux` and `windows` —
+  4 apps resolve on each. The earlier version of this check silently fell back
+  to the local registry because I guessed the `load_config` signature; the
+  corrected call is `load_config(platform=…, config_path=…)`.
+* Scrub-test guard exercised with bash genuinely unresolvable on `PATH`.
+* Pushed `e2b6ff8`, `6d7eef6` to `BaxtersLab/SOC_Master_Widget` (`master`).
+
+### Advisory for the Windows agent
+
+`/run/media/baxter/USB321FD/soc ultralight mirror advisory/` — `INDEX.md` +
+`SOC_MIRROR_ADVISORY.md`, plus a generated `soc-ultralight.ico` (7 sizes) and
+`generate_icon.py`. Six items, ordered by urgency, with an explicit "do NOT
+port" section. It is **separate from** `windows agent handoff/` (the 2026-08-04
+port list) and says so; neither supersedes the other and they must not be
+merged. Windows behaviour claims in it are labelled UNVERIFIED — there is no
+Windows box here.
+
 ## [2026-08-07] — Answered "one repo or two": **one**. Win32 window management gated behind `WINDOW_MGMT`; Linux work pushed to `BaxtersLab/SOC_Master_Widget`
 
 Operator asked whether the board is cross-platform or needs a second Linux repo
