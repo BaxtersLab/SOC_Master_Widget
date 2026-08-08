@@ -2,6 +2,83 @@
 
 _Append-only (Article VIII). Newest entry at the top._
 
+## [2026-08-07] — Answered "one repo or two": **one**. Win32 window management gated behind `WINDOW_MGMT`; Linux work pushed to `BaxtersLab/SOC_Master_Widget`
+
+Operator asked whether the board is cross-platform or needs a second Linux repo
+like `SOC_Ultralight_Lin`. Measured rather than guessed:
+
+* The module imports clean on Linux — **no module-level `ctypes` import**, all
+  10 are function-local.
+* The registry already carries `cmd` **and** `cmd_linux`; `gen_launchers.py`
+  already emits `.desktop` files; the suite already skips Windows-only tests.
+  The codebase was written cross-platform.
+* Win32 surface is **28% of lines but one concern**: window management. Compare
+  SOC Ultralight, where forking was justified — 41 call sites across capture
+  *and* injection, needing three backend implementations.
+
+**Verdict: one repo.** Forking would duplicate the registry, which is the one
+file that must stay in step with the cluster, to save gating four functions.
+
+### The bug this exposed
+
+The virtual-desktop dock was built on **every** platform. On Linux:
+`dock_state()` raised `module 'ctypes' has no attribute 'windll'`,
+`_dock_poll()` caught it every 600 ms and fell back to `"unknown"`, so
+`_dock_click` took its `else` branch and logged **"SOC not running — nothing to
+dock to"** — whether or not SOC was running. Not a crash; a control that was
+permanently inert and wrong about why. (First read of this said "clicking
+throws"; it does not, the poller swallows it. The functions do throw when
+called directly.)
+
+`WINDOW_MGMT = os.name == "nt"` now gates it. The dock is **not built** off
+Windows rather than built-and-disabled, and `switch_desktop` / `snap_window` /
+`window_under_cursor` / `mouse_left_down` raise `UnsupportedOnThisPlatform`
+instead of an `AttributeError` that named the wrong problem. The snap grid was
+already gated (line 905). Windows behaviour is untouched.
+
+**One non-obvious dependency:** `toggle_log` packs the log `before=dock`. With
+no dock that is `before=None`, which Tk rejects — the log would have failed to
+re-open. `dock` is now bound to `None` before the closure and the pack is
+conditional.
+
+### Traps hit
+
+- **A test read PASSED while all four of its subtests failed.** Under
+  `pytest-subtests`, subtest failures are reported on their own lines and the
+  parent still prints PASSED — seen against the pre-fix module. The suite's exit
+  code was right, but the line was misleading, so that test no longer uses
+  `subTest`: it collects failures and asserts once.
+
+### Open Stubs
+
+None introduced.
+
+### Verification
+
+* `pytest` → **55 passed, 8 skipped** in the workspace.
+* **From a fresh `git clone`** → 53 passed, 10 skipped. The 2 extra skips are
+  the documented no-local-registry path, not a regression.
+* The 5 new tests **proven to fail first**, run against the file-cabinet copy
+  which predated the change: 5 failed / 0 passed.
+* **Widget tree introspected on the live Linux window** (mainloop stubbed):
+  `WINDOW_MGMT=False`, 23 text widgets, **zero** dock-related; board shows
+  `▶ Start Stack`, `Refresh`, `▾ Hide`.
+* Log pane driven through hide → re-show with no dock present: `▸ Show` →
+  `▾ Hide`, no exception. This is the `before=dock` path.
+* `./run.sh` first-run bootstrap exercised **from the clean clone** — created
+  the registry from the example and stopped, as run.bat does.
+* Pushed `5956289..e3c6087` to `BaxtersLab/SOC_Master_Widget` (branch
+  **`master`**, not `main`). Confirmed no repo-only content was lost: every
+  line the workspace removes is this session's own re-indentation.
+
+### Note for the next session
+
+`soc_master_apps.json` is **gitignored** ("the REAL registry is a private
+composition — only the example ships"). The AiSmartGuy removal is therefore
+local + file-cabinet only and is **not** on GitHub. If the example registry
+should also drop it, that is a separate edit to
+`soc_master_apps.example.json`.
+
 ## [2026-08-07] — The scrub in `run.sh` is now executed by a test, not trusted; "21 vars" corrected
 
 Follow-on to the entry below. SOC Ultralight's `run.sh` got the same scrub block
