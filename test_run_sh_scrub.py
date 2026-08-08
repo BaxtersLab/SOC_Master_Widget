@@ -18,6 +18,8 @@ An edit that breaks the block therefore fails here, not at launch.
 """
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,6 +28,16 @@ import pytest
 RUN_SH = Path(__file__).resolve().parent / "run.sh"
 BEGIN = "# (scrub:begin)"
 END = "# (scrub:end)"
+
+# This module lives in a repo that is shared with the Windows fork, and it
+# executes a bash fragment. Without this guard the module-scoped fixture raises
+# FileNotFoundError on a Windows box with no bash on PATH and every test in the
+# file ERRORs — a red suite for a launcher Windows does not even use, since the
+# board starts there through run.bat. Matching the "no bash available" skip
+# already used in test_master_widget.py.
+pytestmark = pytest.mark.skipif(
+    os.name != "posix" or shutil.which("bash") is None,
+    reason="run.sh is the POSIX launcher; Windows starts the board via run.bat")
 
 # Copied from a live VS Code terminal on this box. Two shapes matter and the
 # block catches them by different rules: values starting with /snap/ (caught by
