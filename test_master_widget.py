@@ -174,6 +174,18 @@ class ActionEntryTests(unittest.TestCase):
 
     def test_show_a4_entry_present_and_ready(self):
         # The live registry must expose Show A4 Vision as a ready on-demand action.
+        #
+        # This asserts against the OPERATOR'S REAL registry (soc_master_apps.json),
+        # which is deliberately private and not in the repo — only
+        # soc_master_apps.example.json ships. Without it `load_config` raises
+        # SystemExit, which unittest reports as an ERROR and which looks like a
+        # code fault rather than a missing local file. Skip cleanly instead, so a
+        # fresh checkout reports "skipped (no local registry)" and not a red suite.
+        if not (Path(w.__file__).resolve().parent / "soc_master_apps.json").is_file():
+            self.skipTest(
+                "soc_master_apps.json not present (private registry); "
+                "copy soc_master_apps.example.json and register your apps to run this"
+            )
         data = w.load_config(platform="win")
         entry = next((a for a in data["apps"] if a["name"] == "Show A4 Vision"), None)
         self.assertIsNotNone(entry, "Show A4 Vision entry missing from registry")
@@ -250,8 +262,25 @@ class VSCodiumDependencyTests(unittest.TestCase):
     PATH/common install dirs itself, then a 'Locate/Install' button lets the
     operator browse to it or trigger a silent winget install. These test the
     injectable search/persist/install logic without touching the real
-    filesystem, PATH, or actually invoking winget."""
+    filesystem, PATH, or actually invoking winget.
 
+    Windows-only, and skipped elsewhere, for two reasons:
+      1. The logic under test IS Windows-specific — `_candidate_vscodium_paths`
+         reads LOCALAPPDATA / ProgramFiles* and looks for `VSCodium.exe`, and
+         `install_vscodium_via_winget` shells out to winget.
+      2. The assertions use literal `C:\\...` strings, which pathlib treats as a
+         single filename component on POSIX, so they cannot pass there.
+
+    IMPORTANT — skipping is not the same as working. On Linux `find_vscodium()`
+    always returns None: there is no discovery for `shutil.which("codium")`,
+    /usr/bin/codium, /snap/bin/codium or flatpak, and no non-winget install path.
+    That gap is real and is recorded in handoffs.md; it is not covered by tests
+    here because the feature does not exist yet."""
+
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "asserts literal C:\\ paths; pathlib treats them as one filename component on POSIX",
+    )
     def test_candidate_paths_from_env(self):
         env = {"LOCALAPPDATA": r"C:\Users\x\AppData\Local",
                "ProgramFiles": r"C:\Program Files"}
@@ -262,6 +291,10 @@ class VSCodiumDependencyTests(unittest.TestCase):
     def test_candidate_paths_skips_unset_env_vars(self):
         self.assertEqual(w._candidate_vscodium_paths({}), [])
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "asserts literal C:\\ paths; pathlib treats them as one filename component on POSIX",
+    )
     def test_find_vscodium_direct_exe_on_path(self):
         target = Path(r"C:\Users\x\AppData\Local\Programs\VSCodium\VSCodium.exe")
         found = w.find_vscodium(
@@ -281,6 +314,10 @@ class VSCodiumDependencyTests(unittest.TestCase):
             is_file=lambda p: Path(p) == exe_path)
         self.assertEqual(found, exe_path)
 
+    @unittest.skipUnless(
+        sys.platform == "win32",
+        "asserts literal C:\\ paths; pathlib treats them as one filename component on POSIX",
+    )
     def test_find_vscodium_falls_back_to_candidate_dirs(self):
         env = {"LOCALAPPDATA": r"C:\Users\x\AppData\Local"}
         target = Path(r"C:\Users\x\AppData\Local\Programs\VSCodium\VSCodium.exe")
@@ -474,3 +511,129 @@ class GridTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
+
+
+class EnvOverrideTests(unittest.TestCase):
+    """Per-app `env` from the registry must actually reach the child.
+
+    Added because the key was introduced for Hot Rod Tuner's HOTROD_PORT and
+    _launch() built its Popen kwargs without ever reading it — the setting
+    would have been silently ignored and HRT would still have collided with
+    llama-server on 8080.
+    """
+
+    def test_env_is_passed_and_layered_over_os_environ(self):
+        import unittest.mock as mock
+        app = {"name": "E", "_cmd": ["x"], "_dir": Path("."), "env": {"HOTROD_PORT": 8085}}
+        with mock.patch("subprocess.Popen", return_value=mock.Mock(pid=7)) as popen:
+            w._launch(app, lambda m: None, {})
+        env = popen.call_args.kwargs.get("env")
+        self.assertIsNotNone(env, "env was not passed to Popen")
+        self.assertEqual(env["HOTROD_PORT"], "8085")        # stringified for execve
+        self.assertIn("PATH", env, "inherited environment was dropped")
+
+    def test_no_env_key_leaves_popen_untouched(self):
+        import unittest.mock as mock
+        app = {"name": "E", "_cmd": ["x"], "_dir": Path(".")}
+        with mock.patch("subprocess.Popen", return_value=mock.Mock(pid=8)) as popen:
+            w._launch(app, lambda m: None, {})
+        self.assertNotIn("env", popen.call_args.kwargs)
+
+    def test_hrt_registry_entry_moves_off_the_llama_server_port(self):
+        if not (Path(w.__file__).resolve().parent / "soc_master_apps.json").is_file():
+            self.skipTest("no local registry")
+        data = w.load_config(platform="linux")
+        hrt = next((a for a in data["apps"] if a["name"] == "Ai Hot Rod Tuner"), None)
+        self.assertIsNotNone(hrt, "Ai Hot Rod Tuner missing from registry")
+        self.assertEqual(hrt.get("order"), 1, "HRT should be the first button")
+        self.assertNotEqual(str(hrt.get("env", {}).get("HOTROD_PORT")), "8080")
+
+
+class WindowManagementCapabilityTests(unittest.TestCase):
+    """The Win32-only window-management surface, and that it is not offered
+    where it cannot work.
+
+    Before this was gated, the dock was built on every platform. On Linux
+    dock_state() raised `module 'ctypes' has no attribute 'windll'`,
+    _dock_poll() swallowed it every 600 ms and fell back to "unknown", and a
+    click then reported "SOC not running — nothing to dock to" whether or not
+    SOC was actually running. A control that cannot work should be absent, not
+    present and wrong about why.
+    """
+
+    WIN32_ONLY = ("switch_desktop", "snap_window",
+                  "window_under_cursor", "mouse_left_down")
+
+    def test_capability_flag_tracks_the_platform(self):
+        self.assertEqual(w.WINDOW_MGMT, sys.platform == "win32")
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "the guard under test only fires off Windows")
+    def test_win32_entry_points_raise_a_named_error(self):
+        """Not AttributeError: that named the wrong problem. The caller reached
+        a Windows capability; ctypes is not the story.
+
+        Deliberately NOT written with subTest. Under pytest-subtests a subtest
+        failure is reported on its own line and the PARENT still prints PASSED
+        — verified against the pre-fix module, where all four subtests failed
+        and this test read PASSED. The suite's exit code is right either way,
+        but a test that reads green while the thing it guards is broken is
+        worse than no test. Failures are collected and asserted once.
+        """
+        calls = {
+            "switch_desktop": lambda: w.switch_desktop("right"),
+            "snap_window": lambda: w.snap_window("t", (0, 0, 10, 10)),
+            "window_under_cursor": lambda: w.window_under_cursor(),
+            "mouse_left_down": lambda: w.mouse_left_down(),
+        }
+        wrong = {}
+        for name, call in calls.items():
+            try:
+                call()
+                wrong[name] = "returned normally — no guard at all"
+            except w.UnsupportedOnThisPlatform:
+                pass
+            except BaseException as e:      # noqa: BLE001 — the type IS the assertion
+                wrong[name] = f"{type(e).__name__}: {e}"
+        self.assertEqual(wrong, {},
+                         f"expected UnsupportedOnThisPlatform, got: {wrong}")
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "dock_state talks to Win32 on Windows")
+    def test_dock_state_answers_without_touching_win32(self):
+        """Returns rather than raises — the poller ran this every 600 ms."""
+        self.assertEqual(w.dock_state(), "unsupported")
+
+    def test_dock_ui_is_built_only_under_the_capability_guard(self):
+        """Source-level, because building the widget needs a display and this
+        suite creates no GUI. Asserts the dock's construction sits inside
+        `if WINDOW_MGMT:` — the thing that keeps it off the Linux window."""
+        import ast
+        src = Path(w.__file__).resolve().with_suffix(".py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        dock_line = next(
+            (n.lineno for n in ast.walk(tree)
+             if isinstance(n, ast.Assign)
+             and any(getattr(t, "id", "") == "dock" for t in n.targets)
+             and isinstance(n.value, ast.Call)
+             and "Frame" in ast.dump(n.value)),
+            None)
+        self.assertIsNotNone(dock_line, "dock frame construction not found")
+
+        guarded = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.If)
+            and isinstance(n.test, ast.Name) and n.test.id == "WINDOW_MGMT"
+            and n.body and n.body[0].lineno <= dock_line <= n.end_lineno
+        ]
+        self.assertTrue(
+            guarded,
+            f"dock frame at line {dock_line} is not inside `if WINDOW_MGMT:` — "
+            f"it would be built and inert on Linux")
+
+    def test_log_toggle_does_not_assume_a_dock_exists(self):
+        """toggle_log packs the log `before=dock`. With no dock that is
+        `before=None`, which Tk rejects — the log would fail to reopen."""
+        src = Path(w.__file__).resolve().with_suffix(".py").read_text(encoding="utf-8")
+        self.assertIn("if dock is not None:", src)
+        self.assertIn("dock = None", src)

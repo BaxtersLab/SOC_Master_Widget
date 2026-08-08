@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SOC Master Widget
+GenericName=Launcher Board
+Comment=One board to start the SOC Ultralight cluster in order
+# Must be run.sh, never soc_master_widget.py directly: the board spawns the
+# other apps as children, so it is where the snap-environment scrub has to
+# happen — LOCPATH from a snap kills every python child outright.
+Exec=/home/baxter/workspace/SOC_Master_Widget/run.sh
+TryExec=/home/baxter/workspace/SOC_Master_Widget/run.sh
+Path=/home/baxter/workspace/SOC_Master_Widget
+Icon=soc-master-widget
+Terminal=false
+Categories=Utility;
+Keywords=soc;launcher;board;cluster;stack;
+StartupNotify=true
+# Tk sets WM_CLASS from tk.Tk(className=…) in soc_master_widget.py's main().
+StartupWMClass=soc-master-widget

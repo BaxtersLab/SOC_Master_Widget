@@ -35,8 +35,35 @@ else:
     HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "soc_master_apps.json"
 ICON = HERE / "assets" / "master_widget.ico"
+# Tk's iconbitmap() only accepts .ico on Windows; on X11 it wants an XBM and
+# raises TclError on a .ico, so the window fell back to the bare Tk feather.
+# iconphoto() takes a PhotoImage, which reads PNG natively in Tk 8.6.
+ICON_PNG = HERE / "assets" / "soc-master-widget.png"
 
 CREATE_NEW_CONSOLE = 0x00000010  # Windows: give a console app its own window
+
+# ── Platform capability: window management ───────────────────────────────────
+# Docking to a virtual desktop, snap-to-grid and click-to-pick are Win32 calls
+# through ctypes.windll. There is no portable equivalent to reach for: Wayland
+# deliberately refuses to let a client enumerate, place or focus another app's
+# windows, and this box is Wayland-only. So this is a Windows capability, and
+# the honest thing on other platforms is to not offer it.
+#
+# The controls are therefore NOT BUILT when this is False, rather than built
+# and disabled. A visible control that cannot work invites a click and then has
+# to explain itself, and the dock's explanation was actively wrong: dock_state()
+# raised AttributeError on Linux, _dock_poll() caught it and fell back to
+# "unknown", and clicking then reported "SOC not running — nothing to dock to"
+# whether or not SOC was running.
+WINDOW_MGMT = os.name == "nt"
+
+
+class UnsupportedOnThisPlatform(RuntimeError):
+    """A Win32-only window-management call was made on another platform.
+
+    Raised in place of the `module 'ctypes' has no attribute 'windll'`
+    AttributeError, which named the wrong problem — the caller's mistake is
+    reaching a Windows capability, not a missing attribute."""
 
 # Single-instance lock: first launch binds this port and holds it for its
 # lifetime (the OS releases it on process death — no stale-lockfile problem).
@@ -304,7 +331,12 @@ def dock_state() -> str:
     """'docked'  = SOC runs on ANOTHER desktop (pulse!)
        'here'    = SOC is on THIS desktop
        'none'    = SOC not running
-       'unknown' = COM unavailable (indicator stays passive)"""
+       'unknown' = COM unavailable (indicator stays passive)
+       'unsupported' = not Windows; there is no dock to report on"""
+    if not WINDOW_MGMT:
+        # Answered without touching Win32 rather than left to raise: the poller
+        # ran this every 600 ms and swallowed the AttributeError each time.
+        return "unsupported"
     hwnd = _find_window(SOC_WINDOW_TITLE)
     if not hwnd:
         return "none"
@@ -316,6 +348,8 @@ def dock_state() -> str:
 
 def switch_desktop(direction: str):
     """Native virtual-desktop switch via Win+Ctrl+Left/Right (keybd_event)."""
+    if not WINDOW_MGMT:
+        raise UnsupportedOnThisPlatform("virtual-desktop switching is Windows-only")
     import ctypes
     u = ctypes.windll.user32
     VK_WIN, VK_CTRL = 0x5B, 0x11
@@ -427,6 +461,8 @@ def find_window_by_title(title: str):
 def snap_window(title: str, rect, hwnd=None):
     """Move ONE window to rect, resolving its handle by title when the passed one
     is missing/invalid. Returns (hwnd, status) — 'snapped' | 'missing' | 'error:…'."""
+    if not WINDOW_MGMT:
+        raise UnsupportedOnThisPlatform("snap-to-grid is Windows-only")
     import ctypes
     user32 = ctypes.windll.user32
     try:
@@ -448,6 +484,8 @@ def snap_window(title: str, rect, hwnd=None):
 
 def mouse_left_down() -> bool:
     """True while the physical left mouse button is held (async key state)."""
+    if not WINDOW_MGMT:
+        raise UnsupportedOnThisPlatform("global mouse-button state is Windows-only")
     import ctypes
     user32 = ctypes.windll.user32
     user32.GetAsyncKeyState.restype = ctypes.c_short
@@ -459,6 +497,8 @@ def window_under_cursor():
     ('', [0,0,0,0]) on failure. Windows-only. WindowFromPoint takes POINT BY
     VALUE and returns a 64-bit HWND, so those prototypes are declared explicitly —
     ctypes would otherwise mis-marshal the struct and truncate the handle."""
+    if not WINDOW_MGMT:
+        raise UnsupportedOnThisPlatform("picking a window by cursor is Windows-only")
     import ctypes
     from ctypes import wintypes
 
@@ -657,6 +697,15 @@ def _launch(app, log, procs):
         kwargs = {}
         if os.name == "nt" and app.get("console", True):
             kwargs["creationflags"] = CREATE_NEW_CONSOLE
+        # Optional per-app environment from the registry, layered over our own.
+        # Needed where two apps default to the same port: Hot Rod Tuner binds
+        # 8080, which llama-server already owns, and whichever starts second
+        # simply fails — so the registry sets HOTROD_PORT rather than the
+        # operator having to remember. Values are stringified because JSON
+        # numbers are legal here but execve requires strings.
+        extra_env = app.get("env")
+        if extra_env:
+            kwargs["env"] = {**os.environ, **{k: str(v) for k, v in extra_env.items()}}
         proc = subprocess.Popen(app["_cmd"], cwd=str(d), **kwargs)
         if app.get("action"):
             # Fire-and-forget control action (e.g. write a signal file, then exit).
@@ -705,11 +754,20 @@ def gui():
             a["_ready"] = True
             print(f"[locate] {a['name']}: found -> {found} (saved to {CONFIG.name})")
 
-    root = tk.Tk()
+    # className sets WM_CLASS, which is how GNOME matches a window to its
+    # .desktop file (StartupWMClass=soc-master-widget) to pick the dash icon.
+    # Tk's default is the generic "tk"/"Tk" — SOC Ultralight is also Tk, so
+    # without a distinct class the two apps are indistinguishable to the shell.
+    root = tk.Tk(className="soc-master-widget")
     root.title(data.get("title", "SOC Master Widget"))
     try:
-        if ICON.is_file():
+        if os.name == "nt" and ICON.is_file():
             root.iconbitmap(str(ICON))
+        elif ICON_PNG.is_file():
+            # Held on root: Tk keeps no reference to a PhotoImage, so a local
+            # would be garbage-collected and the icon would blank out.
+            root._icon_img = tk.PhotoImage(file=str(ICON_PNG))
+            root.iconphoto(True, root._icon_img)
     except Exception:
         pass                       # icon is cosmetic — never block startup
     root.geometry("270x600")
@@ -975,6 +1033,9 @@ def gui():
     logbox.pack(fill="both", expand=True)
 
     _log_shown = {"v": True}
+    # Bound before toggle_log so the closure always resolves it. Stays None off
+    # Windows, where the dock is not built at all.
+    dock = None
 
     def toggle_log(_e=None):
         root.update_idletasks()
@@ -987,7 +1048,13 @@ def gui():
             root.geometry(f"{wcur}x{max(hcur - h, 300)}")
             _log_shown["v"] = False
         else:
-            logbox.pack(fill="both", expand=True, before=dock)
+            # The dock is the last packed widget on Windows, so the log has to
+            # go BEFORE it to stay above. Where there is no dock the log is
+            # last anyway, and `before=None` is not a valid pack option.
+            if dock is not None:
+                logbox.pack(fill="both", expand=True, before=dock)
+            else:
+                logbox.pack(fill="both", expand=True)
             log_toggle_btn.config(text="▾ Hide")
             root.minsize(250, 540)                       # restore the expanded floor
             root.update_idletasks()
@@ -999,58 +1066,64 @@ def gui():
     # ── Vi_minimizer dock — the pulsing rectangle ─────────────────────────────
     # Pulses yellow↔orange while the SOC swarm lives on ANOTHER virtual desktop
     # ("docked"); click hops in/out (Win+Ctrl+←/→) with everything left running.
-    YELLOW, ORANGE_P = "#f5d90a", "#ff8c00"
-    dock = tk.Frame(outer, bg=BG2, highlightbackground=IDLE,
-                    highlightthickness=3, cursor="hand2")
-    dock.pack(fill="x", pady=(8, 0))
-    dock_state_lbl = tk.Label(dock, text="Inactive", bg=BG2, fg=ACCENT,
-                              font=("Segoe UI", 12, "bold"), cursor="hand2")
-    dock_state_lbl.pack(pady=(6, 0))
-    dock_hint_lbl = tk.Label(dock, text="click to dock virtual desktop",
-                             bg=BG2, fg=FG, font=("Segoe UI", 10, "bold"),
-                             cursor="hand2")
-    dock_hint_lbl.pack(pady=(0, 6))
+    #
+    # Windows-only, and NOT BUILT elsewhere — see WINDOW_MGMT. Virtual desktops
+    # are driven here by keybd_event through ctypes.windll; Wayland has no
+    # equivalent a client may call. Shown-but-inert was the old Linux
+    # behaviour and it misreported "SOC not running" whatever the truth.
+    if WINDOW_MGMT:
+        YELLOW, ORANGE_P = "#f5d90a", "#ff8c00"
+        dock = tk.Frame(outer, bg=BG2, highlightbackground=IDLE,
+                        highlightthickness=3, cursor="hand2")
+        dock.pack(fill="x", pady=(8, 0))
+        dock_state_lbl = tk.Label(dock, text="Inactive", bg=BG2, fg=ACCENT,
+                                  font=("Segoe UI", 12, "bold"), cursor="hand2")
+        dock_state_lbl.pack(pady=(6, 0))
+        dock_hint_lbl = tk.Label(dock, text="click to dock virtual desktop",
+                                 bg=BG2, fg=FG, font=("Segoe UI", 10, "bold"),
+                                 cursor="hand2")
+        dock_hint_lbl.pack(pady=(0, 6))
 
-    _dock = {"state": "none", "pulse": False}
+        _dock = {"state": "none", "pulse": False}
 
-    def _dock_click(_e=None):
-        st = _dock["state"]
-        if st == "docked":
-            log("[dock] hopping to the swarm desktop →")
-            switch_desktop("right")
-        elif st == "here":
-            log("[dock] ← returning to the main desktop")
-            switch_desktop("left")
-        else:
-            log("[dock] SOC not running — nothing to dock to")
+        def _dock_click(_e=None):
+            st = _dock["state"]
+            if st == "docked":
+                log("[dock] hopping to the swarm desktop →")
+                switch_desktop("right")
+            elif st == "here":
+                log("[dock] ← returning to the main desktop")
+                switch_desktop("left")
+            else:
+                log("[dock] SOC not running — nothing to dock to")
 
-    for w in (dock, dock_state_lbl, dock_hint_lbl):
-        w.bind("<Button-1>", _dock_click)
+        for w in (dock, dock_state_lbl, dock_hint_lbl):
+            w.bind("<Button-1>", _dock_click)
 
-    def _dock_poll():
-        try:
-            st = dock_state()
-        except Exception:
-            st = "unknown"
-        _dock["state"] = st
-        if st == "docked":
-            # Pulse the border yellow↔orange so "the swarm is elsewhere,
-            # running" is unmistakable at a glance.
-            _dock["pulse"] = not _dock["pulse"]
-            dock.configure(highlightbackground=YELLOW if _dock["pulse"] else ORANGE_P)
-            dock_state_lbl.configure(text="DOCKED — swarm running", fg=YELLOW)
-            dock_hint_lbl.configure(text="click to enter virtual desktop")
-        elif st == "here":
-            dock.configure(highlightbackground=GREEN)
-            dock_state_lbl.configure(text="Active — on this desktop", fg=GREEN)
-            dock_hint_lbl.configure(text="click to return to main desktop")
-        else:
-            dock.configure(highlightbackground=IDLE)
-            dock_state_lbl.configure(text="Inactive", fg=ACCENT)
-            dock_hint_lbl.configure(text="click to dock virtual desktop")
-        root.after(600, _dock_poll)
+        def _dock_poll():
+            try:
+                st = dock_state()
+            except Exception:
+                st = "unknown"
+            _dock["state"] = st
+            if st == "docked":
+                # Pulse the border yellow↔orange so "the swarm is elsewhere,
+                # running" is unmistakable at a glance.
+                _dock["pulse"] = not _dock["pulse"]
+                dock.configure(highlightbackground=YELLOW if _dock["pulse"] else ORANGE_P)
+                dock_state_lbl.configure(text="DOCKED — swarm running", fg=YELLOW)
+                dock_hint_lbl.configure(text="click to enter virtual desktop")
+            elif st == "here":
+                dock.configure(highlightbackground=GREEN)
+                dock_state_lbl.configure(text="Active — on this desktop", fg=GREEN)
+                dock_hint_lbl.configure(text="click to return to main desktop")
+            else:
+                dock.configure(highlightbackground=IDLE)
+                dock_state_lbl.configure(text="Inactive", fg=ACCENT)
+                dock_hint_lbl.configure(text="click to dock virtual desktop")
+            root.after(600, _dock_poll)
 
-    _dock_poll()
+        _dock_poll()
 
     # Raise this window whenever a second launch pings the instance lock.
     def bring_to_front():
@@ -1069,8 +1142,10 @@ def gui():
                      daemon=True).start()
 
     log("Ready. Start Stack launches 1 -> 2 -> 3.")
-    log("[dock] to keep this widget on BOTH desktops: Win+Tab -> right-click"
-        " this window -> 'Show this window on all desktops' (once per session)")
+    if WINDOW_MGMT:
+        # Win+Tab advice is meaningless without the dock it refers to.
+        log("[dock] to keep this widget on BOTH desktops: Win+Tab -> right-click"
+            " this window -> 'Show this window on all desktops' (once per session)")
     refresh()
     root.mainloop()
 
