@@ -543,8 +543,13 @@ class EnvOverrideTests(unittest.TestCase):
         if not (Path(w.__file__).resolve().parent / "soc_master_apps.json").is_file():
             self.skipTest("no local registry")
         data = w.load_config(platform="linux")
-        hrt = next((a for a in data["apps"] if a["name"] == "Ai Hot Rod Tuner"), None)
-        self.assertIsNotNone(hrt, "Ai Hot Rod Tuner missing from registry")
+        # The live registry is gitignored and per-operator, so the entry's exact
+        # label differs between boxes ("Hot Rod Tuner" here, "Ai Hot Rod Tuner"
+        # on the Linux box). Match the app, not one box's spelling of it — the
+        # assertion below is the point and it stays as strict as it was.
+        hrt = next((a for a in data["apps"]
+                    if "hot rod tuner" in a["name"].casefold()), None)
+        self.assertIsNotNone(hrt, "Hot Rod Tuner missing from registry")
         self.assertEqual(hrt.get("order"), 1, "HRT should be the first button")
         self.assertNotEqual(str(hrt.get("env", {}).get("HOTROD_PORT")), "8080")
 
